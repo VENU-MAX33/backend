@@ -1,158 +1,121 @@
-from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import List, Optional
 import json
+from datetime import datetime
 
-import models
-from database import engine, SessionLocal
+# Appwrite SDK
+from appwrite.client import Client
+from appwrite.services.databases import Databases
+from appwrite.id import ID
+from appwrite.query import Query
 
-# Authentication removed - no login required
+# Import Appwrite configuration
+from appwrite_config import (
+    APPWRITE_ENDPOINT,
+    APPWRITE_PROJECT_ID,
+    APPWRITE_DATABASE_ID,
+    APPWRITE_API_KEY,
+    COLLECTIONS
+)
 
-# Create Database Tables
-models.Base.metadata.create_all(bind=engine)
+# =============================================================================
+# APPWRITE CLIENT SETUP
+# =============================================================================
 
-app = FastAPI(title="Sports Arena API", description="Multi-sport live scoring platform for Cricket, Kabaddi, and Volleyball")
+client = Client()
+client.set_endpoint(APPWRITE_ENDPOINT)
+client.set_project(APPWRITE_PROJECT_ID)
+client.set_key(APPWRITE_API_KEY)  # API key for server-side operations
+
+databases = Databases(client)
+
+# =============================================================================
+# FASTAPI APP SETUP
+# =============================================================================
+
+app = FastAPI(
+    title="Sports Arena API - Appwrite Edition",
+    description="Multi-sport live scoring platform connected to Appwrite"
+)
 
 # CORS Setup
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all for local dev
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# Dependency to get DB session
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
 # =============================================================================
-# PYDANTIC MODELS FOR REQUEST/RESPONSE
+# PYDANTIC MODELS
 # =============================================================================
 
 class PlayerInfo(BaseModel):
     name: str
-    is_captain: bool = False
+    age: Optional[int] = None
+    registerNo: Optional[str] = None
+    isCaptain: bool = False
 
 
-class TeamCreate(BaseModel):
+class SimpleTeamCreate(BaseModel):
     name: str
-    sport: str = "cricket"  # cricket, kabaddi, volleyball
-    captain: str
-    phone: str
-    email: str
+    sport: str = "cricket"
+    captain: Optional[str] = None
     players: List[PlayerInfo]
-    location: str
-    experience: str
-
-
-class TeamResponse(BaseModel):
-    id: int
-    name: str
-    sport: str
-    captain: str
-    phone: str
-    email: str
-    players: str  # JSON string
-    location: str
-    experience: str
-    wins: int
-    losses: int
-    matches_played: int
-    points: int
-    logo_color_start: str
-    logo_color_end: str
-    symbol: str
-
-    class Config:
-        from_attributes = True
 
 
 class MatchCreate(BaseModel):
-    team1_id: int
-    team2_id: int
-    date: str
-    time: str
-    venue: str
-    sport: str = "cricket"
-    # Sport-specific config
-    total_overs: Optional[int] = 20          # Cricket
-    half_duration: Optional[int] = 20        # Kabaddi (minutes per half)
-    ttp_points: Optional[int] = 0            # Volleyball (0 = match mode, else TTP)
-    total_sets: Optional[int] = 3            # Volleyball match mode
-
-
-class MatchListResponse(BaseModel):
-    id: int
-    sport: str
+    team1_id: str
+    team2_id: str
     team1_name: str
     team2_name: str
-    date: str
-    time: str
-    venue: str
-    status: str
-    result: Optional[str] = None
-    # Quick score summary
-    score_summary: Optional[str] = None
-
-    class Config:
-        from_attributes = True
+    sport: str = "cricket"
+    venue: str = "Sports Arena"
+    admin_name: Optional[str] = "Admin"
+    umpire_name: Optional[str] = "Umpire"
+    total_overs: Optional[int] = 20
 
 
-class TossUpdate(BaseModel):
-    winner_team_id: int
-    choice: str  # bat/bowl (cricket), raid/defend (kabaddi), serve (volleyball)
+class ScoreUpdate(BaseModel):
+    match_id: str
+    team_id: str
+    runs: Optional[int] = 0
+    wickets: Optional[int] = 0
+    overs: Optional[float] = 0.0
+    extras: Optional[int] = 0
+    action: Optional[str] = None  # For kabaddi/volleyball
 
 
-class CricketScoreUpdate(BaseModel):
-    run: int
-    is_wicket: bool = False
-    extra_type: Optional[str] = None  # "WD", "NB", "B", "LB"
-    batsman_out: Optional[str] = None
-    new_batsman: Optional[str] = None
-
-
-class KabaddiScoreUpdate(BaseModel):
-    team_id: int  # which team scored
-    action: str   # "raid", "tackle", "super_tackle", "bonus", "self_out", "all_out"
-    points: int = 1
-
-
-class VolleyballScoreUpdate(BaseModel):
-    team_id: int  # which team scored
-    action: str   # "point", "undo", "set_won", "toggle_serve"
+class AchievementCreate(BaseModel):
+    match_id: str
+    player_name: str
+    achievement_type: str  # "man_of_match", "best_bowler", "best_batsman", etc.
+    description: str
 
 
 # =============================================================================
-# WEBSOCKET MANAGER
+# WEBSOCKET MANAGER FOR LIVE UPDATES
 # =============================================================================
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: dict[int, List[WebSocket]] = {}
+        self.active_connections: dict[str, List[WebSocket]] = {}
 
-    async def connect(self, websocket: WebSocket, match_id: int):
+    async def connect(self, websocket: WebSocket, match_id: str):
         await websocket.accept()
         if match_id not in self.active_connections:
             self.active_connections[match_id] = []
         self.active_connections[match_id].append(websocket)
 
-    def disconnect(self, websocket: WebSocket, match_id: int):
+    def disconnect(self, websocket: WebSocket, match_id: str):
         if match_id in self.active_connections:
             if websocket in self.active_connections[match_id]:
                 self.active_connections[match_id].remove(websocket)
-            if not self.active_connections[match_id]:
-                del self.active_connections[match_id]
 
-    async def broadcast(self, message: dict, match_id: int):
+    async def broadcast(self, message: dict, match_id: str):
         if match_id in self.active_connections:
             for connection in self.active_connections[match_id]:
                 try:
@@ -164,1033 +127,517 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-# Authentication endpoints removed - no login required
+# =============================================================================
+# HEALTH CHECK
+# =============================================================================
+
+@app.get("/")
+def root():
+    return {
+        "message": "Sports Arena API - Appwrite Edition",
+        "status": "running",
+        "database": "Appwrite",
+        "endpoints": [
+            "/api/teams",
+            "/api/teams/register",
+            "/api/matches",
+            "/api/matches/create",
+            "/api/matches/{match_id}/score",
+            "/api/achievements"
+        ]
+    }
 
 
 # =============================================================================
 # TEAM ENDPOINTS
 # =============================================================================
 
-def get_sport_symbol(sport: str) -> str:
-    """Get default symbol for sport"""
-    symbols = {"cricket": "🏏", "kabaddi": "🤼", "volleyball": "🏐"}
-    return symbols.get(sport, "🏆")
-
-
-def get_sport_colors(sport: str) -> tuple:
-    """Get default colors for sport"""
-    colors = {
-        "cricket": ("#16a34a", "#22c55e"),
-        "kabaddi": ("#ea580c", "#f97316"),
-        "volleyball": ("#2563eb", "#3b82f6")
-    }
-    return colors.get(sport, ("#1e40af", "#2563eb"))
-
-
-@app.post("/api/register", response_model=dict)
-@app.post("/api/teams", response_model=dict)
-def register_team(team: TeamCreate, db: Session = Depends(get_db)):
-    """Register a new team (public endpoint)"""
-    existing = db.query(models.Team).filter(models.Team.name == team.name).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Team name already taken")
-    
-    # Validate sport
-    if team.sport not in ["cricket", "kabaddi", "volleyball"]:
-        raise HTTPException(status_code=400, detail="Invalid sport. Must be cricket, kabaddi, or volleyball")
-    
-    # Validate minimum players
-    min_players = {"cricket": 11, "kabaddi": 7, "volleyball": 6}
-    if len(team.players) < min_players.get(team.sport, 6):
-        raise HTTPException(
-            status_code=400, 
-            detail=f"{team.sport.title()} requires at least {min_players[team.sport]} players"
+@app.post("/api/teams/register")
+@app.post("/api/teams")
+def register_team(team: SimpleTeamCreate):
+    """Register a new team to Appwrite"""
+    try:
+        # Prepare players data
+        players_data = []
+        captain_name = team.captain
+        
+        for p in team.players:
+            player_dict = {
+                "name": p.name,
+                "is_captain": p.isCaptain
+            }
+            if p.age:
+                player_dict["age"] = p.age
+            if p.registerNo:
+                player_dict["register_no"] = p.registerNo
+            players_data.append(player_dict)
+            
+            if p.isCaptain and not captain_name:
+                captain_name = p.name
+        
+        if not captain_name and players_data:
+            captain_name = players_data[0]["name"]
+        
+        # Convert players to a short comma-separated string (Appwrite string limit)
+        players_str = ", ".join([p.name for p in team.players])
+        
+        # Create document in Appwrite 'teams' collection
+        response = databases.create_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=COLLECTIONS["teams"],
+            document_id=ID.unique(),
+            data={
+                "name": team.name,
+                "sport": team.sport,
+                "captain": captain_name or "",
+                "players": players_str,  # Short string, NOT json.dumps
+                "wins": 0,
+                "losses": 0,
+                "matches_played": 0,
+                "points": 0,
+                "created_at": datetime.now().isoformat()
+            }
         )
-    
-    # Convert players list to JSON
-    players_json = json.dumps([p.dict() for p in team.players])
-    
-    # Get sport-specific aesthetics
-    color_start, color_end = get_sport_colors(team.sport)
-    symbol = get_sport_symbol(team.sport)
-    
-    db_team = models.Team(
-        name=team.name,
-        sport=team.sport,
-        captain=team.captain,
-        phone=team.phone,
-        email=team.email,
-        players=players_json,
-        location=team.location,
-        experience=team.experience,
-        logo_color_start=color_start,
-        logo_color_end=color_end,
-        symbol=symbol
-    )
-    db.add(db_team)
-    db.commit()
-    db.refresh(db_team)
-    return {"id": db_team.id, "message": f"{team.sport.title()} team registered successfully"}
+        
+        return {
+            "id": response["$id"],
+            "message": f"{team.sport.title()} team '{team.name}' registered successfully!"
+        }
+        
+    except Exception as e:
+        print(f"Error registering team: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/api/teams", response_model=List[TeamResponse])
-def get_teams(sport: Optional[str] = None, db: Session = Depends(get_db)):
-    """Get all teams, optionally filtered by sport"""
-    query = db.query(models.Team)
-    if sport:
-        query = query.filter(models.Team.sport == sport)
-    return query.all()
+@app.get("/api/teams")
+def get_teams(sport: Optional[str] = None):
+    """Get all teams from Appwrite"""
+    try:
+        queries = []
+        if sport:
+            queries.append(Query.equal("sport", sport))
+        
+        response = databases.list_documents(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=COLLECTIONS["teams"],
+            queries=queries
+        )
+        
+        teams = []
+        for doc in response["documents"]:
+            teams.append({
+                "id": doc["$id"],
+                "name": doc.get("name", ""),
+                "sport": doc.get("sport", "cricket"),
+                "captain": doc.get("captain", ""),
+                "players": doc.get("players", "[]"),
+                "wins": doc.get("wins", 0),
+                "losses": doc.get("losses", 0),
+                "matches_played": doc.get("matches_played", 0),
+                "points": doc.get("points", 0)
+            })
+        
+        return teams
+        
+    except Exception as e:
+        print(f"Error fetching teams: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/teams/{team_id}", response_model=TeamResponse)
-def get_team(team_id: int, db: Session = Depends(get_db)):
+@app.get("/api/teams/{team_id}")
+def get_team(team_id: str):
     """Get a specific team by ID"""
-    team = db.query(models.Team).filter(models.Team.id == team_id).first()
-    if not team:
+    try:
+        response = databases.get_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=COLLECTIONS["teams"],
+            document_id=team_id
+        )
+        
+        return {
+            "id": response["$id"],
+            "name": response.get("name", ""),
+            "sport": response.get("sport", "cricket"),
+            "captain": response.get("captain", ""),
+            "players": response.get("players", "[]"),
+            "wins": response.get("wins", 0),
+            "losses": response.get("losses", 0),
+            "matches_played": response.get("matches_played", 0),
+            "points": response.get("points", 0)
+        }
+        
+    except Exception as e:
+        print(f"Error fetching team: {e}")
         raise HTTPException(status_code=404, detail="Team not found")
-    return team
 
 
 # =============================================================================
 # MATCH ENDPOINTS
 # =============================================================================
 
-@app.get("/api/matches", response_model=List[MatchListResponse])
-def get_matches(
-    sport: Optional[str] = None,
-    status: Optional[str] = None,
-    db: Session = Depends(get_db)
-):
-    """Get all matches, optionally filtered by sport and status"""
-    query = db.query(models.Match)
-    if sport:
-        query = query.filter(models.Match.sport == sport)
-    if status:
-        query = query.filter(models.Match.status == status)
-    
-    matches = query.all()
-    result = []
-    for match in matches:
-        t1 = db.query(models.Team).filter(models.Team.id == match.team1_id).first()
-        t2 = db.query(models.Team).filter(models.Team.id == match.team2_id).first()
-        
-        # Generate score summary based on sport
-        score_summary = None
-        if match.sport == "cricket":
-            if match.current_innings == 1:
-                score_summary = f"{match.total_runs}/{match.wickets} ({match.overs} ov)"
-            else:
-                score_summary = f"{match.innings2_runs}/{match.innings2_wickets} ({match.innings2_overs} ov)"
-        elif match.sport == "kabaddi":
-            t1_total = match.team1_raid_points + match.team1_tackle_points + (match.team1_all_outs * 2) + match.team1_bonus_points
-            t2_total = match.team2_raid_points + match.team2_tackle_points + (match.team2_all_outs * 2) + match.team2_bonus_points
-            score_summary = f"{t1_total} - {t2_total}"
-        elif match.sport == "volleyball":
-            if match.ttp_points > 0:
-                score_summary = f"{match.team1_current_points} - {match.team2_current_points}"
-            else:
-                score_summary = f"{match.team1_sets} - {match.team2_sets} sets"
-        
-        result.append({
-            "id": match.id,
-            "sport": match.sport,
-            "team1_name": t1.name if t1 else "TBA",
-            "team2_name": t2.name if t2 else "TBA",
-            "date": match.date,
-            "time": match.time,
-            "venue": match.venue,
-            "status": match.status,
-            "result": match.result,
-            "score_summary": score_summary
-        })
-    return result
-
-
-@app.post("/api/matches", response_model=dict)
-def create_match(
-    match: MatchCreate,
-    db: Session = Depends(get_db)
-):
-    """Create a new match (public endpoint for admin panel)"""
-    team1 = db.query(models.Team).filter(models.Team.id == match.team1_id).first()
-    team2 = db.query(models.Team).filter(models.Team.id == match.team2_id).first()
-    
-    if not team1 or not team2:
-        raise HTTPException(status_code=404, detail="One or both teams not found")
-    
-    if match.team1_id == match.team2_id:
-        raise HTTPException(status_code=400, detail="Teams must be different")
-    
-    # Validate teams are of correct sport
-    if team1.sport != match.sport or team2.sport != match.sport:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Both teams must be {match.sport} teams"
+@app.post("/api/matches/create")
+@app.post("/api/matches")
+def create_match(match: MatchCreate):
+    """Create a new match in Appwrite"""
+    try:
+        response = databases.create_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=COLLECTIONS["matches"],
+            document_id=ID.unique(),
+            data={
+                "sport": match.sport,
+                "team1_id": match.team1_id,
+                "team2_id": match.team2_id,
+                "team1_name": match.team1_name,
+                "team2_name": match.team2_name,
+                "venue": match.venue,
+                "admin_name": match.admin_name,
+                "umpire_name": match.umpire_name,
+                "total_overs": match.total_overs,
+                "status": "UPCOMING",
+                "team1_score": 0,
+                "team1_wickets": 0,
+                "team1_overs": 0,
+                "team2_score": 0,
+                "team2_wickets": 0,
+                "team2_overs": 0,
+                "current_innings": 1,
+                "result": "",
+                "created_at": datetime.now().isoformat()
+            }
         )
-    
-    db_match = models.Match(
-        sport=match.sport,
-        team1_id=match.team1_id,
-        team2_id=match.team2_id,
-        date=match.date,
-        time=match.time,
-        venue=match.venue,
-        status="UPCOMING",
-        # created_by_id removed - match can be created without authentication
-        # Cricket
-        total_overs=match.total_overs or 20,
-        batting_team_id=match.team1_id,
-        bowling_team_id=match.team2_id,
-        # Kabaddi
-        half_duration_minutes=match.half_duration or 20,
-        # Volleyball
-        ttp_points=match.ttp_points or 0,
-        total_sets=match.total_sets or 3,
-        serve_team_id=match.team1_id
-    )
-    db.add(db_match)
-    db.commit()
-    db.refresh(db_match)
-    
-    return {
-        "id": db_match.id,
-        "message": f"{match.sport.title()} match created successfully.",
-        "team1": team1.name,
-        "team2": team2.name
-    }
+        
+        return {
+            "id": response["$id"],
+            "message": f"Match created: {match.team1_name} vs {match.team2_name}",
+            "match_id": response["$id"]
+        }
+        
+    except Exception as e:
+        print(f"Error creating match: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/matches")
+def get_matches(sport: Optional[str] = None, status: Optional[str] = None):
+    """Get all matches from Appwrite"""
+    try:
+        queries = []
+        if sport:
+            queries.append(Query.equal("sport", sport))
+        if status:
+            queries.append(Query.equal("status", status))
+        
+        response = databases.list_documents(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=COLLECTIONS["matches"],
+            queries=queries
+        )
+        
+        matches = []
+        for doc in response["documents"]:
+            matches.append({
+                "id": doc["$id"],
+                "sport": doc.get("sport", "cricket"),
+                "team1_id": doc.get("team1_id", ""),
+                "team2_id": doc.get("team2_id", ""),
+                "team1_name": doc.get("team1_name", "Team 1"),
+                "team2_name": doc.get("team2_name", "Team 2"),
+                "venue": doc.get("venue", ""),
+                "status": doc.get("status", "UPCOMING"),
+                "team1_score": doc.get("team1_score", 0),
+                "team1_wickets": doc.get("team1_wickets", 0),
+                "team2_score": doc.get("team2_score", 0),
+                "team2_wickets": doc.get("team2_wickets", 0),
+                "result": doc.get("result", ""),
+                "score_summary": f"{doc.get('team1_score', 0)}/{doc.get('team1_wickets', 0)}"
+            })
+        
+        return matches
+        
+    except Exception as e:
+        print(f"Error fetching matches: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/matches/{match_id}")
-def get_match_details(
-    match_id: int,
-    db: Session = Depends(get_db)
-):
-    """Get detailed match information based on sport"""
-    match = db.query(models.Match).filter(models.Match.id == match_id).first()
-    if not match:
-        raise HTTPException(status_code=404, detail="Match not found")
-    
-    t1 = db.query(models.Team).filter(models.Team.id == match.team1_id).first()
-    t2 = db.query(models.Team).filter(models.Team.id == match.team2_id).first()
-    is_admin = True  # All users have admin access now
-    
-    # Base response
-    response = {
-        "id": match.id,
-        "sport": match.sport,
-        "team1": {
-            "id": t1.id if t1 else None,
-            "name": t1.name if t1 else "TBA",
-            "players": json.loads(t1.players) if t1 else [],
-            "symbol": t1.symbol if t1 else "🏆",
-            "color_start": t1.logo_color_start if t1 else "#1e40af",
-            "color_end": t1.logo_color_end if t1 else "#2563eb"
-        },
-        "team2": {
-            "id": t2.id if t2 else None,
-            "name": t2.name if t2 else "TBA",
-            "players": json.loads(t2.players) if t2 else [],
-            "symbol": t2.symbol if t2 else "🏆",
-            "color_start": t2.logo_color_start if t2 else "#1e40af",
-            "color_end": t2.logo_color_end if t2 else "#2563eb"
-        },
-        "date": match.date,
-        "time": match.time,
-        "venue": match.venue,
-        "status": match.status,
-        "result": match.result,
-        "is_admin": is_admin,
-        "toss_winner_id": match.toss_winner_id,
-        "toss_choice": match.toss_choice
-    }
-    
-    # Add sport-specific data
-    if match.sport == "cricket":
-        batting = db.query(models.Team).filter(models.Team.id == match.batting_team_id).first()
-        bowling = db.query(models.Team).filter(models.Team.id == match.bowling_team_id).first()
+def get_match(match_id: str):
+    """Get match details by ID"""
+    try:
+        response = databases.get_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=COLLECTIONS["matches"],
+            document_id=match_id
+        )
         
-        response.update({
-            "total_overs": match.total_overs,
-            "current_innings": match.current_innings,
-            "target": match.target,
-            "batting_team": batting.name if batting else "TBA",
-            "bowling_team": bowling.name if bowling else "TBA",
-            "innings1": {
-                "runs": match.total_runs,
-                "wickets": match.wickets,
-                "overs": match.overs
+        return {
+            "id": response["$id"],
+            "sport": response.get("sport", "cricket"),
+            "team1": {
+                "id": response.get("team1_id", ""),
+                "name": response.get("team1_name", "Team 1"),
+                "score": response.get("team1_score", 0),
+                "wickets": response.get("team1_wickets", 0),
+                "overs": response.get("team1_overs", 0)
             },
-            "innings2": {
-                "runs": match.innings2_runs,
-                "wickets": match.innings2_wickets,
-                "overs": match.innings2_overs
-            } if match.current_innings == 2 else None,
-            "ball_history": json.loads(match.ball_history) if match.ball_history else []
-        })
-    
-    elif match.sport == "kabaddi":
-        response.update({
-            "half_duration_minutes": match.half_duration_minutes,
-            "current_half": match.current_half,
-            "team1_score": {
-                "raid_points": match.team1_raid_points,
-                "tackle_points": match.team1_tackle_points,
-                "all_outs": match.team1_all_outs,
-                "bonus_points": match.team1_bonus_points,
-                "total": match.team1_raid_points + match.team1_tackle_points + (match.team1_all_outs * 2) + match.team1_bonus_points
+            "team2": {
+                "id": response.get("team2_id", ""),
+                "name": response.get("team2_name", "Team 2"),
+                "score": response.get("team2_score", 0),
+                "wickets": response.get("team2_wickets", 0),
+                "overs": response.get("team2_overs", 0)
             },
-            "team2_score": {
-                "raid_points": match.team2_raid_points,
-                "tackle_points": match.team2_tackle_points,
-                "all_outs": match.team2_all_outs,
-                "bonus_points": match.team2_bonus_points,
-                "total": match.team2_raid_points + match.team2_tackle_points + (match.team2_all_outs * 2) + match.team2_bonus_points
-            }
-        })
-    
-    elif match.sport == "volleyball":
-        response.update({
-            "ttp_points": match.ttp_points,
-            "total_sets": match.total_sets,
-            "current_set": match.current_set,
-            "serve_team_id": match.serve_team_id,
-            "team1_score": {
-                "sets": match.team1_sets,
-                "current_points": match.team1_current_points,
-                "set_points": json.loads(match.team1_set_points) if match.team1_set_points else []
-            },
-            "team2_score": {
-                "sets": match.team2_sets,
-                "current_points": match.team2_current_points,
-                "set_points": json.loads(match.team2_set_points) if match.team2_set_points else []
-            },
-            "point_history": json.loads(match.point_history) if match.point_history else []
-        })
-    
-    return response
+            "venue": response.get("venue", ""),
+            "status": response.get("status", "UPCOMING"),
+            "current_innings": response.get("current_innings", 1),
+            "total_overs": response.get("total_overs", 20),
+            "result": response.get("result", ""),
+            "is_admin": True
+        }
+        
+    except Exception as e:
+        print(f"Error fetching match: {e}")
+        raise HTTPException(status_code=404, detail="Match not found")
 
 
 @app.post("/api/matches/{match_id}/start")
-def start_match(
-    match_id: int,
-    db: Session = Depends(get_db)
-):
-    """Start a match (public endpoint for admin panel)"""
-    match = db.query(models.Match).filter(models.Match.id == match_id).first()
-    if not match:
-        raise HTTPException(status_code=404, detail="Match not found")
-    
-    match.status = "LIVE"
-    db.commit()
-    
-    return {"message": "Match started", "status": "LIVE"}
-
-
-@app.put("/api/matches/{match_id}/toss")
-async def save_toss(
-    match_id: int,
-    toss: TossUpdate,
-    db: Session = Depends(get_db)
-):
-    """Save toss result and set batting/serving team (public endpoint for admin panel)"""
-    match = db.query(models.Match).filter(models.Match.id == match_id).first()
-    if not match:
-        raise HTTPException(status_code=404, detail="Match not found")
-    
-    # Validate winner team
-    if toss.winner_team_id not in [match.team1_id, match.team2_id]:
-        raise HTTPException(status_code=400, detail="Invalid toss winner team")
-    
-    match.toss_winner_id = toss.winner_team_id
-    match.toss_choice = toss.choice
-    
-    # Set batting/bowling or serve based on choice
-    other_team = match.team2_id if toss.winner_team_id == match.team1_id else match.team1_id
-    
-    if match.sport == "cricket":
-        if toss.choice == "bat":
-            match.batting_team_id = toss.winner_team_id
-            match.bowling_team_id = other_team
-        else:  # bowl
-            match.batting_team_id = other_team
-            match.bowling_team_id = toss.winner_team_id
-    elif match.sport == "kabaddi":
-        if toss.choice == "raid":
-            match.batting_team_id = toss.winner_team_id  # Reusing as raiding team
-        else:  # defend
-            match.batting_team_id = other_team
-    elif match.sport == "volleyball":
-        match.serve_team_id = toss.winner_team_id
-    
-    db.commit()
-    
-    # Broadcast toss result
-    t1 = db.query(models.Team).filter(models.Team.id == match.team1_id).first()
-    t2 = db.query(models.Team).filter(models.Team.id == match.team2_id).first()
-    winner = db.query(models.Team).filter(models.Team.id == toss.winner_team_id).first()
-    
-    await manager.broadcast({
-        "event": "toss",
-        "match_id": match_id,
-        "winner": winner.name if winner else "TBA",
-        "choice": toss.choice,
-        "message": f"{winner.name if winner else 'Team'} won the toss and chose to {toss.choice}"
-    }, match_id)
-    
-    return {"message": "Toss saved", "winner": winner.name if winner else "TBA", "choice": toss.choice}
+def start_match(match_id: str):
+    """Start a match"""
+    try:
+        response = databases.update_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=COLLECTIONS["matches"],
+            document_id=match_id,
+            data={"status": "LIVE"}
+        )
+        
+        return {"message": "Match started", "status": "LIVE"}
+        
+    except Exception as e:
+        print(f"Error starting match: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # =============================================================================
-# CRICKET SCORING
+# LIVE SCORE ENDPOINTS
 # =============================================================================
 
 @app.post("/api/matches/{match_id}/score")
 @app.put("/api/matches/{match_id}/score")
-async def update_cricket_score(
-    match_id: int,
-    update: CricketScoreUpdate,
-    db: Session = Depends(get_db)
-):
-    """Update cricket match score (public endpoint for admin panel)"""
-    match = db.query(models.Match).filter(models.Match.id == match_id).first()
-    if not match:
-        raise HTTPException(status_code=404, detail="Match not found")
-    
-    if match.sport != "cricket":
-        raise HTTPException(status_code=400, detail="This endpoint is for cricket matches only")
-    
-    if match.status != "LIVE":
-        raise HTTPException(status_code=400, detail="Match is not live")
-    
-    # Determine which innings
-    if match.current_innings == 1:
-        runs_attr, wickets_attr, overs_attr = 'total_runs', 'wickets', 'overs'
-    else:
-        runs_attr, wickets_attr, overs_attr = 'innings2_runs', 'innings2_wickets', 'innings2_overs'
-    
-    current_runs = getattr(match, runs_attr)
-    current_wickets = getattr(match, wickets_attr)
-    current_overs = getattr(match, overs_attr)
-    
-    # Ball entry for history
-    ball_entry = {
-        "ball": int(current_overs * 6) + int((current_overs % 1) * 10) + 1,
-        "runs": update.run,
-        "wicket": update.is_wicket,
-        "extra_type": update.extra_type,
-        "innings": match.current_innings
-    }
-    
-    # Cricket scoring logic
-    if update.extra_type in ["WD", "NB"]:  # Wide or No Ball
-        setattr(match, runs_attr, current_runs + 1 + update.run)
-        ball_entry["total_runs"] = 1 + update.run
-    else:  # Normal delivery
-        setattr(match, runs_attr, current_runs + update.run)
-        ball_entry["total_runs"] = update.run
-        # Increment balls
-        balls = int(round((current_overs - int(current_overs)) * 10))
-        balls += 1
-        if balls == 6:
-            setattr(match, overs_attr, int(current_overs) + 1.0)
+async def update_score(match_id: str, score: ScoreUpdate):
+    """Update match score in Appwrite and broadcast to WebSocket clients"""
+    try:
+        # Get current match data
+        match = databases.get_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=COLLECTIONS["matches"],
+            document_id=match_id
+        )
+        
+        # Determine which team to update
+        update_data = {}
+        if score.team_id == match.get("team1_id"):
+            update_data = {
+                "team1_score": match.get("team1_score", 0) + score.runs,
+                "team1_wickets": match.get("team1_wickets", 0) + score.wickets,
+                "team1_overs": score.overs if score.overs else match.get("team1_overs", 0)
+            }
         else:
-            setattr(match, overs_attr, float(f"{int(current_overs)}.{balls}"))
-    
-    if update.is_wicket:
-        setattr(match, wickets_attr, current_wickets + 1)
-        ball_entry["batsman_out"] = update.batsman_out
-        ball_entry["new_batsman"] = update.new_batsman
-    
-    # Save ball history
-    history = json.loads(match.ball_history) if match.ball_history else []
-    history.append(ball_entry)
-    match.ball_history = json.dumps(history)
-    
-    db.commit()
-    
-    # Get updated values
-    updated_runs = getattr(match, runs_attr)
-    updated_wickets = getattr(match, wickets_attr)
-    updated_overs = getattr(match, overs_attr)
-    
-    # Broadcast update
-    batting = db.query(models.Team).filter(models.Team.id == match.batting_team_id).first()
-    bowling = db.query(models.Team).filter(models.Team.id == match.bowling_team_id).first()
-    
-    await manager.broadcast({
-        "event": "score_update",
-        "sport": "cricket",
-        "match_id": match_id,
-        "score": updated_runs,
-        "wickets": updated_wickets,
-        "overs": updated_overs,
-        "current_innings": match.current_innings,
-        "target": match.target,
-        "batting_team": batting.name if batting else "TBA",
-        "bowling_team": bowling.name if bowling else "TBA",
-        "status": match.status,
-        "last_ball": ball_entry
-    }, match_id)
+            update_data = {
+                "team2_score": match.get("team2_score", 0) + score.runs,
+                "team2_wickets": match.get("team2_wickets", 0) + score.wickets,
+                "team2_overs": score.overs if score.overs else match.get("team2_overs", 0)
+            }
+        
+        # Update in Appwrite
+        response = databases.update_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=COLLECTIONS["matches"],
+            document_id=match_id,
+            data=update_data
+        )
+        
+        # Also create a live_score entry for real-time tracking
+        try:
+            databases.create_document(
+                database_id=APPWRITE_DATABASE_ID,
+                collection_id=COLLECTIONS["live_scores"],
+                document_id=ID.unique(),
+                data={
+                    "match_id": match_id,
+                    "team_id": score.team_id,
+                    "runs": score.runs,
+                    "wickets": score.wickets,
+                    "overs": score.overs,
+                    "action": score.action or "score_update",
+                    "timestamp": datetime.now().isoformat()
+                }
+            )
+        except Exception as e:
+            print(f"Warning: Could not create live_score entry: {e}")
+        
+        # Broadcast to WebSocket clients
+        await manager.broadcast({
+            "event": "score_update",
+            "match_id": match_id,
+            "team_id": score.team_id,
+            "runs_added": score.runs,
+            "wickets_added": score.wickets,
+            "current_score": update_data
+        }, match_id)
+        
+        return {
+            "message": "Score updated successfully",
+            "score": update_data
+        }
+        
+    except Exception as e:
+        print(f"Error updating score: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
-    return {
-        "message": "Score updated",
-        "score": f"{updated_runs}/{updated_wickets}",
-        "overs": updated_overs
-    }
 
-
-@app.post("/api/matches/{match_id}/end_innings")
-async def end_innings(
-    match_id: int,
-    db: Session = Depends(get_db)
-):
-    """End current innings and switch to second innings (cricket) (public endpoint for admin panel)"""
-    match = db.query(models.Match).filter(models.Match.id == match_id).first()
-    if not match:
-        raise HTTPException(status_code=404, detail="Match not found")
-    
-    if match.sport != "cricket":
-        raise HTTPException(status_code=400, detail="This endpoint is for cricket matches only")
-    
-    if match.current_innings == 2:
-        raise HTTPException(status_code=400, detail="Second innings already in progress or match finished")
-    
-    # Set target and switch innings
-    match.target = match.total_runs + 1
-    match.current_innings = 2
-    
-    # Swap batting/bowling teams
-    match.batting_team_id, match.bowling_team_id = match.bowling_team_id, match.batting_team_id
-    
-    db.commit()
-    
-    # Broadcast innings change
-    t1 = db.query(models.Team).filter(models.Team.id == match.batting_team_id).first()
-    t2 = db.query(models.Team).filter(models.Team.id == match.bowling_team_id).first()
-    
-    await manager.broadcast({
-        "event": "innings_change",
-        "match_id": match_id,
-        "current_innings": 2,
-        "target": match.target,
-        "batting_team": t1.name if t1 else "TBA",
-        "bowling_team": t2.name if t2 else "TBA",
-        "message": f"Second innings started. Target: {match.target}"
-    }, match_id)
-    
-    return {
-        "message": "Second innings started",
-        "target": match.target,
-        "batting_team": t1.name if t1 else "TBA"
-    }
+@app.post("/api/matches/{match_id}/end")
+def end_match(match_id: str, result: str = ""):
+    """End a match and set the result"""
+    try:
+        response = databases.update_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=COLLECTIONS["matches"],
+            document_id=match_id,
+            data={
+                "status": "COMPLETED",
+                "result": result
+            }
+        )
+        
+        return {"message": "Match ended", "result": result}
+        
+    except Exception as e:
+        print(f"Error ending match: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # =============================================================================
-# KABADDI SCORING
+# ACHIEVEMENTS ENDPOINTS
 # =============================================================================
 
-@app.post("/api/matches/{match_id}/kabaddi/score")
-@app.put("/api/matches/{match_id}/kabaddi/score")
-async def update_kabaddi_score(
-    match_id: int,
-    update: KabaddiScoreUpdate,
-    db: Session = Depends(get_db)
-):
-    """Update kabaddi match score (public endpoint for admin panel)"""
-    match = db.query(models.Match).filter(models.Match.id == match_id).first()
-    if not match:
-        raise HTTPException(status_code=404, detail="Match not found")
-    
-    if match.sport != "kabaddi":
-        raise HTTPException(status_code=400, detail="This endpoint is for kabaddi matches only")
-    
-    if match.status != "LIVE":
-        raise HTTPException(status_code=400, detail="Match is not live")
-    
-    # Validate team
-    if update.team_id not in [match.team1_id, match.team2_id]:
-        raise HTTPException(status_code=400, detail="Invalid team ID")
-    
-    is_team1 = update.team_id == match.team1_id
-    other_team = match.team2_id if is_team1 else match.team1_id
-    
-    # Apply score based on action
-    if update.action == "raid":
-        if is_team1:
-            match.team1_raid_points += update.points
-        else:
-            match.team2_raid_points += update.points
-    
-    elif update.action == "tackle":
-        if is_team1:
-            match.team1_tackle_points += 1
-        else:
-            match.team2_tackle_points += 1
-    
-    elif update.action == "super_tackle":
-        if is_team1:
-            match.team1_tackle_points += 2
-        else:
-            match.team2_tackle_points += 2
-    
-    elif update.action == "bonus":
-        if is_team1:
-            match.team1_bonus_points += 1
-        else:
-            match.team2_bonus_points += 1
-    
-    elif update.action == "self_out":
-        # Points go to opponent
-        if is_team1:
-            match.team2_raid_points += 1
-        else:
-            match.team1_raid_points += 1
-    
-    elif update.action == "all_out":
-        if is_team1:
-            match.team1_all_outs += 1
-        else:
-            match.team2_all_outs += 1
-    
-    db.commit()
-    
-    # Calculate totals
-    team1_total = match.team1_raid_points + match.team1_tackle_points + (match.team1_all_outs * 2) + match.team1_bonus_points
-    team2_total = match.team2_raid_points + match.team2_tackle_points + (match.team2_all_outs * 2) + match.team2_bonus_points
-    
-    # Broadcast update
-    t1 = db.query(models.Team).filter(models.Team.id == match.team1_id).first()
-    t2 = db.query(models.Team).filter(models.Team.id == match.team2_id).first()
-    
-    await manager.broadcast({
-        "event": "score_update",
-        "sport": "kabaddi",
-        "match_id": match_id,
-        "team1_score": {
-            "name": t1.name if t1 else "Team 1",
-            "raid_points": match.team1_raid_points,
-            "tackle_points": match.team1_tackle_points,
-            "all_outs": match.team1_all_outs,
-            "bonus_points": match.team1_bonus_points,
-            "total": team1_total
-        },
-        "team2_score": {
-            "name": t2.name if t2 else "Team 2",
-            "raid_points": match.team2_raid_points,
-            "tackle_points": match.team2_tackle_points,
-            "all_outs": match.team2_all_outs,
-            "bonus_points": match.team2_bonus_points,
-            "total": team2_total
-        },
-        "action": update.action,
-        "scoring_team": t1.name if is_team1 else t2.name
-    }, match_id)
-
-    return {
-        "message": "Score updated",
-        "team1_total": team1_total,
-        "team2_total": team2_total
-    }
-
-
-@app.post("/api/matches/{match_id}/kabaddi/half")
-async def switch_kabaddi_half(
-    match_id: int,
-    db: Session = Depends(get_db)
-):
-    """Switch to second half in kabaddi (public endpoint for admin panel)"""
-    match = db.query(models.Match).filter(models.Match.id == match_id).first()
-    if not match:
-        raise HTTPException(status_code=404, detail="Match not found")
-    
-    if match.sport != "kabaddi":
-        raise HTTPException(status_code=400, detail="This endpoint is for kabaddi matches only")
-    
-    match.current_half = 2
-    db.commit()
-    
-    await manager.broadcast({
-        "event": "half_change",
-        "match_id": match_id,
-        "current_half": 2,
-        "message": "Second half started"
-    }, match_id)
-    
-    return {"message": "Second half started"}
-
-
-# =============================================================================
-# VOLLEYBALL SCORING
-# =============================================================================
-
-@app.post("/api/matches/{match_id}/volleyball/score")
-@app.put("/api/matches/{match_id}/volleyball/score")
-async def update_volleyball_score(
-    match_id: int,
-    update: VolleyballScoreUpdate,
-    db: Session = Depends(get_db)
-):
-    """Update volleyball match score (public endpoint for admin panel)"""
-    match = db.query(models.Match).filter(models.Match.id == match_id).first()
-    if not match:
-        raise HTTPException(status_code=404, detail="Match not found")
-    
-    if match.sport != "volleyball":
-        raise HTTPException(status_code=400, detail="This endpoint is for volleyball matches only")
-    
-    if match.status != "LIVE":
-        raise HTTPException(status_code=400, detail="Match is not live")
-    
-    is_team1 = update.team_id == match.team1_id
-    
-    # Point history for undo
-    history = json.loads(match.point_history) if match.point_history else []
-    
-    if update.action == "point":
-        if is_team1:
-            match.team1_current_points += 1
-        else:
-            match.team2_current_points += 1
+@app.post("/api/achievements")
+def create_achievement(achievement: AchievementCreate):
+    """Create an achievement in Appwrite"""
+    try:
+        response = databases.create_document(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=COLLECTIONS["achievements"],
+            document_id=ID.unique(),
+            data={
+                "match_id": achievement.match_id,
+                "player_name": achievement.player_name,
+                "achievement_type": achievement.achievement_type,
+                "description": achievement.description,
+                "created_at": datetime.now().isoformat()
+            }
+        )
         
-        history.append({"team": 1 if is_team1 else 2, "action": "point"})
-        match.point_history = json.dumps(history)
-    
-    elif update.action == "undo":
-        if history:
-            last = history.pop()
-            if last["team"] == 1:
-                match.team1_current_points = max(0, match.team1_current_points - 1)
-            else:
-                match.team2_current_points = max(0, match.team2_current_points - 1)
-            match.point_history = json.dumps(history)
-    
-    elif update.action == "toggle_serve":
-        if match.serve_team_id == match.team1_id:
-            match.serve_team_id = match.team2_id
-        else:
-            match.serve_team_id = match.team1_id
-    
-    elif update.action == "set_won":
-        # Record set points
-        t1_set_points = json.loads(match.team1_set_points) if match.team1_set_points else []
-        t2_set_points = json.loads(match.team2_set_points) if match.team2_set_points else []
+        return {
+            "id": response["$id"],
+            "message": f"Achievement '{achievement.achievement_type}' awarded to {achievement.player_name}"
+        }
         
-        t1_set_points.append(match.team1_current_points)
-        t2_set_points.append(match.team2_current_points)
-        
-        match.team1_set_points = json.dumps(t1_set_points)
-        match.team2_set_points = json.dumps(t2_set_points)
-        
-        # Award set to winner
-        if is_team1:
-            match.team1_sets += 1
-        else:
-            match.team2_sets += 1
-        
-        # Reset current points and move to next set
-        match.team1_current_points = 0
-        match.team2_current_points = 0
-        match.current_set += 1
-        match.point_history = "[]"
-    
-    db.commit()
-    
-    # Broadcast update
-    t1 = db.query(models.Team).filter(models.Team.id == match.team1_id).first()
-    t2 = db.query(models.Team).filter(models.Team.id == match.team2_id).first()
-    serve_team = db.query(models.Team).filter(models.Team.id == match.serve_team_id).first()
-    
-    await manager.broadcast({
-        "event": "score_update",
-        "sport": "volleyball",
-        "match_id": match_id,
-        "current_set": match.current_set,
-        "serve_team": serve_team.name if serve_team else "TBA",
-        "team1_score": {
-            "name": t1.name if t1 else "Team 1",
-            "sets": match.team1_sets,
-            "current_points": match.team1_current_points,
-            "set_points": json.loads(match.team1_set_points) if match.team1_set_points else []
-        },
-        "team2_score": {
-            "name": t2.name if t2 else "Team 2",
-            "sets": match.team2_sets,
-            "current_points": match.team2_current_points,
-            "set_points": json.loads(match.team2_set_points) if match.team2_set_points else []
-        },
-        "action": update.action
-    }, match_id)
+    except Exception as e:
+        print(f"Error creating achievement: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
-    return {
-        "message": "Score updated",
-        "team1_points": match.team1_current_points,
-        "team2_points": match.team2_current_points,
-        "team1_sets": match.team1_sets,
-        "team2_sets": match.team2_sets
-    }
-
-
-# =============================================================================
-# MATCH COMPLETION
-# =============================================================================
-
-@app.post("/api/matches/{match_id}/complete")
-@app.put("/api/matches/{match_id}/complete")
-@app.post("/api/matches/{match_id}/end_match")
-async def end_match(
-    match_id: int,
-    db: Session = Depends(get_db)
-):
-    """End the match and calculate result (public endpoint for admin panel)"""
-    match = db.query(models.Match).filter(models.Match.id == match_id).first()
-    if not match:
-        raise HTTPException(status_code=404, detail="Match not found")
-    
-    match.status = "COMPLETED"
-    
-    t1 = db.query(models.Team).filter(models.Team.id == match.team1_id).first()
-    t2 = db.query(models.Team).filter(models.Team.id == match.team2_id).first()
-    
-    winner = None
-    loser = None
-    
-    if match.sport == "cricket":
-        first_innings_score = match.total_runs
-        second_innings_score = match.innings2_runs
-        
-        if second_innings_score >= match.target:
-            winner, loser = t2, t1
-            wickets_remaining = 10 - match.innings2_wickets
-            match.result = f"{t2.name} won by {wickets_remaining} wickets"
-        else:
-            winner, loser = t1, t2
-            runs_difference = first_innings_score - second_innings_score
-            match.result = f"{t1.name} won by {runs_difference} runs"
-        
-        # Update team stats
-        if winner:
-            winner.total_runs_scored += first_innings_score if winner == t1 else second_innings_score
-            loser.total_runs_scored += second_innings_score if winner == t1 else first_innings_score
-    
-    elif match.sport == "kabaddi":
-        team1_total = match.team1_raid_points + match.team1_tackle_points + (match.team1_all_outs * 2) + match.team1_bonus_points
-        team2_total = match.team2_raid_points + match.team2_tackle_points + (match.team2_all_outs * 2) + match.team2_bonus_points
-        
-        if team1_total > team2_total:
-            winner, loser = t1, t2
-            match.result = f"{t1.name} won by {team1_total - team2_total} points"
-        elif team2_total > team1_total:
-            winner, loser = t2, t1
-            match.result = f"{t2.name} won by {team2_total - team1_total} points"
-        else:
-            match.result = "Match tied"
-        
-        # Update team stats
-        if t1:
-            t1.total_raid_points += match.team1_raid_points
-            t1.total_tackle_points += match.team1_tackle_points
-        if t2:
-            t2.total_raid_points += match.team2_raid_points
-            t2.total_tackle_points += match.team2_tackle_points
-    
-    elif match.sport == "volleyball":
-        if match.ttp_points > 0:  # TTP mode
-            if match.team1_current_points > match.team2_current_points:
-                winner, loser = t1, t2
-                match.result = f"{t1.name} won {match.team1_current_points}-{match.team2_current_points}"
-            else:
-                winner, loser = t2, t1
-                match.result = f"{t2.name} won {match.team2_current_points}-{match.team1_current_points}"
-        else:  # Match mode
-            if match.team1_sets > match.team2_sets:
-                winner, loser = t1, t2
-                match.result = f"{t1.name} won {match.team1_sets}-{match.team2_sets}"
-            else:
-                winner, loser = t2, t1
-                match.result = f"{t2.name} won {match.team2_sets}-{match.team1_sets}"
-        
-        # Update team stats
-        if t1:
-            t1.total_sets_won += match.team1_sets
-        if t2:
-            t2.total_sets_won += match.team2_sets
-    
-    # Update team win/loss stats
-    if winner and loser:
-        winner.wins += 1
-        winner.matches_played += 1
-        winner.points += 2
-        loser.losses += 1
-        loser.matches_played += 1
-    
-    db.commit()
-    
-    # Broadcast match end
-    await manager.broadcast({
-        "event": "match_end",
-        "match_id": match_id,
-        "status": "COMPLETED",
-        "result": match.result,
-        "message": f"Match finished! {match.result}"
-    }, match_id)
-    
-    return {"message": "Match completed", "result": match.result}
-
-
-# =============================================================================
-# ACHIEVEMENTS / LEADERBOARD
-# =============================================================================
 
 @app.get("/api/achievements")
-def get_achievements(sport: Optional[str] = None, db: Session = Depends(get_db)):
-    """Get achievements and leaderboard data"""
-    result = {
-        "top_teams": [],
-        "recent_matches": [],
-        "records": {}
-    }
-    
-    sports_to_query = [sport] if sport else ["cricket", "kabaddi", "volleyball"]
-    
-    for s in sports_to_query:
-        teams = db.query(models.Team).filter(models.Team.sport == s).order_by(models.Team.points.desc()).limit(5).all()
+def get_achievements(match_id: Optional[str] = None, player_name: Optional[str] = None):
+    """Get achievements from Appwrite"""
+    try:
+        queries = []
+        if match_id:
+            queries.append(Query.equal("match_id", match_id))
+        if player_name:
+            queries.append(Query.equal("player_name", player_name))
         
-        for team in teams:
-            result["top_teams"].append({
-                "id": team.id,
-                "name": team.name,
-                "sport": team.sport,
-                "wins": team.wins,
-                "losses": team.losses,
-                "points": team.points,
-                "symbol": team.symbol
+        response = databases.list_documents(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=COLLECTIONS["achievements"],
+            queries=queries
+        )
+        
+        achievements = []
+        for doc in response["documents"]:
+            achievements.append({
+                "id": doc["$id"],
+                "match_id": doc.get("match_id", ""),
+                "player_name": doc.get("player_name", ""),
+                "achievement_type": doc.get("achievement_type", ""),
+                "description": doc.get("description", ""),
+                "created_at": doc.get("created_at", "")
             })
         
-        # Get sport-specific records
-        if s == "cricket":
-            top_scorer = db.query(models.Team).filter(models.Team.sport == "cricket").order_by(models.Team.total_runs_scored.desc()).first()
-            result["records"]["cricket"] = {
-                "highest_runs": {
-                    "team": top_scorer.name if top_scorer else None,
-                    "runs": top_scorer.total_runs_scored if top_scorer else 0
-                }
-            }
-        elif s == "kabaddi":
-            top_raider = db.query(models.Team).filter(models.Team.sport == "kabaddi").order_by(models.Team.total_raid_points.desc()).first()
-            top_defender = db.query(models.Team).filter(models.Team.sport == "kabaddi").order_by(models.Team.total_tackle_points.desc()).first()
-            result["records"]["kabaddi"] = {
-                "most_raid_points": {
-                    "team": top_raider.name if top_raider else None,
-                    "points": top_raider.total_raid_points if top_raider else 0
-                },
-                "most_tackle_points": {
-                    "team": top_defender.name if top_defender else None,
-                    "points": top_defender.total_tackle_points if top_defender else 0
-                }
-            }
-        elif s == "volleyball":
-            top_sets = db.query(models.Team).filter(models.Team.sport == "volleyball").order_by(models.Team.total_sets_won.desc()).first()
-            result["records"]["volleyball"] = {
-                "most_sets_won": {
-                    "team": top_sets.name if top_sets else None,
-                    "sets": top_sets.total_sets_won if top_sets else 0
-                }
-            }
-    
-    # Recent completed matches
-    recent = db.query(models.Match).filter(models.Match.status == "COMPLETED").order_by(models.Match.id.desc()).limit(10).all()
-    for match in recent:
-        t1 = db.query(models.Team).filter(models.Team.id == match.team1_id).first()
-        t2 = db.query(models.Team).filter(models.Team.id == match.team2_id).first()
-        result["recent_matches"].append({
-            "id": match.id,
-            "sport": match.sport,
-            "team1": t1.name if t1 else "TBA",
-            "team2": t2.name if t2 else "TBA",
-            "result": match.result,
-            "date": match.date
-        })
-    
-    return result
+        return achievements
+        
+    except Exception as e:
+        print(f"Error fetching achievements: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =============================================================================
-# WEBSOCKET ENDPOINT
+# REGISTRATIONS ENDPOINTS (for compatibility with frontend)
 # =============================================================================
 
-@app.websocket("/ws/matches/{match_id}")
-async def websocket_endpoint(websocket: WebSocket, match_id: int):
-    """WebSocket endpoint for live score updates"""
+@app.get("/api/registrations")
+def get_registrations():
+    """Get all registrations from Appwrite"""
+    try:
+        response = databases.list_documents(
+            database_id=APPWRITE_DATABASE_ID,
+            collection_id=COLLECTIONS["registrations"]
+        )
+        
+        registrations = []
+        for doc in response["documents"]:
+            registrations.append({
+                "id": doc["$id"],
+                "name": doc.get("name", ""),
+                "email": doc.get("email", ""),
+                "phone": doc.get("phone", ""),
+                "team_id": doc.get("team_id", ""),
+                "players_list": doc.get("players_list", []),
+                "captain": doc.get("captain", ""),
+                "status": doc.get("status", "pending")
+            })
+        
+        return registrations
+        
+    except Exception as e:
+        print(f"Error fetching registrations: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# WEBSOCKET FOR LIVE UPDATES
+# =============================================================================
+
+@app.websocket("/ws/{match_id}")
+async def websocket_endpoint(websocket: WebSocket, match_id: str):
     await manager.connect(websocket, match_id)
     try:
         while True:
             data = await websocket.receive_text()
-            # Could handle ping/pong or chat here
+            # Echo back or handle commands
+            await websocket.send_json({"received": data})
     except WebSocketDisconnect:
         manager.disconnect(websocket, match_id)
 
 
 # =============================================================================
-# DEMO/ADMIN ENDPOINTS
+# RUN SERVER
 # =============================================================================
 
-@app.post("/api/matches/init_demo")
-def init_demo_data(db: Session = Depends(get_db)):
-    """Create demo teams for testing (no auth required)"""
-    created_teams = []
-    
-    # Demo teams for each sport
-    demo_teams = [
-        # Cricket
-        {"name": "Phoenix Warriors", "sport": "cricket", "captain": "Rohit", "symbol": "🦅",
-         "players": json.dumps([{"name": "Rohit", "is_captain": True}] + [{"name": f"Player {i}", "is_captain": False} for i in range(2, 12)])},
-        {"name": "Thunder Strikers", "sport": "cricket", "captain": "Virat", "symbol": "⚡",
-         "players": json.dumps([{"name": "Virat", "is_captain": True}] + [{"name": f"Player {i}", "is_captain": False} for i in range(2, 12)])},
-        # Kabaddi
-        {"name": "Bengal Warriors", "sport": "kabaddi", "captain": "Maninder", "symbol": "🐯",
-         "players": json.dumps([{"name": "Maninder", "is_captain": True}] + [{"name": f"Player {i}", "is_captain": False} for i in range(2, 8)])},
-        {"name": "Patna Pirates", "sport": "kabaddi", "captain": "Pardeep", "symbol": "☠️",
-         "players": json.dumps([{"name": "Pardeep", "is_captain": True}] + [{"name": f"Player {i}", "is_captain": False} for i in range(2, 8)])},
-        # Volleyball
-        {"name": "Chennai Spikers", "sport": "volleyball", "captain": "Ajith", "symbol": "🌊",
-         "players": json.dumps([{"name": "Ajith", "is_captain": True}] + [{"name": f"Player {i}", "is_captain": False} for i in range(2, 7)])},
-        {"name": "Mumbai Blockers", "sport": "volleyball", "captain": "Sachin", "symbol": "🛡️",
-         "players": json.dumps([{"name": "Sachin", "is_captain": True}] + [{"name": f"Player {i}", "is_captain": False} for i in range(2, 7)])}
-    ]
-    
-    for team_data in demo_teams:
-        existing = db.query(models.Team).filter(models.Team.name == team_data["name"]).first()
-        if not existing:
-            color_start, color_end = get_sport_colors(team_data["sport"])
-            team = models.Team(
-                name=team_data["name"],
-                sport=team_data["sport"],
-                captain=team_data["captain"],
-                phone="123456789",
-                email=f"{team_data['name'].lower().replace(' ', '')}@demo.com",
-                players=team_data["players"],
-                location="India",
-                experience="Professional",
-                symbol=team_data["symbol"],
-                logo_color_start=color_start,
-                logo_color_end=color_end
-            )
-            db.add(team)
-            created_teams.append(team_data["name"])
-    
-    db.commit()
-    
-    if created_teams:
-        return {"message": f"Demo teams created: {', '.join(created_teams)}"}
-    return {"message": "Demo teams already exist"}
-
-
-@app.get("/")
-def root():
-    """API root endpoint"""
-    return {
-        "name": "Sports Arena API",
-        "version": "2.0",
-        "sports": ["cricket", "kabaddi", "volleyball"],
-        "docs": "/docs"
-    }
+if __name__ == "__main__":
+    import uvicorn
+    print("🚀 Starting Sports Arena API - Appwrite Edition")
+    print(f"📡 Appwrite Endpoint: {APPWRITE_ENDPOINT}")
+    print(f"📁 Database ID: {APPWRITE_DATABASE_ID}")
+    uvicorn.run(app, host="0.0.0.0", port=8000)

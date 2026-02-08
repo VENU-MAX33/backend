@@ -1,4 +1,6 @@
 fastapi
-uvicorn[standard]
+uvicorn
+pydantic
+appwrite
 sqlalchemy
 python-multipart
